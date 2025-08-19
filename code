@@ -1,0 +1,187 @@
+// ESP32 Smart Traffic Light (2 lanes) with IR sensors + SSD1306 OLED countdown
+// Author: Your Hackathon Project
+// Libraries required: Adafruit_GFX, Adafruit_SSD1306
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define OLED_ADDR     0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------- Pins ----------
+// Lane A LEDs
+const int A_RED    = 12;
+const int A_YELLOW = 14;
+const int A_GREEN  = 27;
+
+// Lane B LEDs
+const int B_RED    = 26;
+const int B_YELLOW = 25;
+const int B_GREEN  = 33;
+
+// IR sensors (active-LOW assumed)
+const int IR_A = 4;   // vehicle detection for Lane A
+const int IR_B = 5;   // vehicle detection for Lane B
+
+// ---------- Timing (ms) ----------
+const uint32_t YELLOW_TIME   = 3000;     // Yellow fixed time
+const uint32_t GREEN_MIN     = 5000;     // Min green time
+const uint32_t GREEN_BASE    = 10000;    // Base green when both lanes active
+const uint32_t GREEN_BONUS   = 8000;     // Extra green if only one lane has cars
+const uint32_t GREEN_MAX     = 25000;    // Max green cap
+const uint32_t NO_CAR_GRACE  = 2000;     // If no car detected, allow early cut
+
+// ---------- State machine ----------
+enum Phase { A_GREEN, A_YELLOW, B_GREEN, B_YELLOW };
+Phase phase = A_GREEN;
+
+uint32_t stateStart = 0;
+uint32_t stateDur   = GREEN_BASE;
+uint32_t lastCarSeenInActiveLane = 0;
+
+// ---------- Helpers ----------
+bool carOnA() { return digitalRead(IR_A) == LOW; } // active-LOW
+bool carOnB() { return digitalRead(IR_B) == LOW; }
+
+void setLightsA(bool r, bool y, bool g) {
+  digitalWrite(A_RED, r);
+  digitalWrite(A_YELLOW, y);
+  digitalWrite(A_GREEN, g);
+}
+void setLightsB(bool r, bool y, bool g) {
+  digitalWrite(B_RED, r);
+  digitalWrite(B_YELLOW, y);
+  digitalWrite(B_GREEN, g);
+}
+
+void enterPhase(Phase p, uint32_t durationMs) {
+  phase = p;
+  stateStart = millis();
+  stateDur   = durationMs;
+
+  switch (phase) {
+    case A_GREEN:
+      setLightsA(false, false, true);
+      setLightsB(true,  false, false);
+      lastCarSeenInActiveLane = millis();
+      break;
+    case A_YELLOW:
+      setLightsA(false, true,  false);
+      setLightsB(true,  false, false);
+      break;
+    case B_GREEN:
+      setLightsA(true,  false, false);
+      setLightsB(false, false, true);
+      lastCarSeenInActiveLane = millis();
+      break;
+    case B_YELLOW:
+      setLightsA(true,  false, false);
+      setLightsB(false, true,  false);
+      break;
+  }
+}
+
+uint32_t msRemaining() {
+  uint32_t now = millis();
+  uint32_t end = stateStart + stateDur;
+  return (now >= end) ? 0 : (end - now);
+}
+
+void drawOLED() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Sensors
+  bool a = carOnA();
+  bool b = carOnB();
+
+  // Top line: Lane + Phase
+  display.setCursor(0, 0);
+  const char* lane = (phase == A_GREEN || phase == A_YELLOW) ? "Lane A" : "Lane B";
+  const char* pstr =
+    (phase == A_GREEN)  ? "GREEN"  :
+    (phase == A_YELLOW) ? "YELLOW" :
+    (phase == B_GREEN)  ? "GREEN"  : "YELLOW";
+  display.printf("%s  %s\n", lane, pstr);
+
+  // Countdown
+  display.setTextSize(2);
+  display.setCursor(0, 18);
+  uint32_t secLeft = (msRemaining() + 999) / 1000;
+  display.printf("T: %lus\n", (unsigned long)secLeft);
+
+  // Bottom: IR status
+  display.setTextSize(1);
+  display.setCursor(0, 48);
+  display.printf("IR A:%s  IR B:%s",
+                 a ? "CAR" : "----",
+                 b ? "CAR" : "----");
+
+  display.display();
+}
+
+// Decide duration of green phase
+uint32_t decideGreenDuration(bool meHasCar, bool otherHasCar) {
+  if (meHasCar && !otherHasCar) return min(GREEN_BASE + GREEN_BONUS, GREEN_MAX);
+  if (!meHasCar && otherHasCar) return GREEN_MIN;
+  if (meHasCar && otherHasCar)  return GREEN_BASE;
+  return GREEN_MIN; // no cars
+}
+
+// End green early if no cars
+bool shouldEndGreenEarly(bool activeHasCar, uint32_t elapsed) {
+  if (activeHasCar) return false;
+  if (elapsed < GREEN_MIN) return false;
+  return (millis() - lastCarSeenInActiveLane) >= NO_CAR_GRACE;
+}
+
+void setup() {
+  // LEDs
+  pinMode(A_RED, OUTPUT);
+  pinMode(A_YELLOW, OUTPUT);
+  pinMode(A_GREEN, OUTPUT);
+  pinMode(B_RED, OUTPUT);
+  pinMode(B_YELLOW, OUTPUT);
+  pinMode(B_GREEN, OUTPUT);
+
+  // IR sensors
+  pinMode(IR_A, INPUT_PULLUP);
+  pinMode(IR_B, INPUT_PULLUP);
+
+  // All red at start
+  setLightsA(true, false, false);
+  setLightsB(true, false, false);
+
+  // OLED
+  Wire.begin(21, 22); // SDA=21, SCL=22
+  display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 20);
+  display.println("Traffic");
+  display.println("System");
+  display.display();
+  delay(1200);
+
+  // Start phase based on demand
+  bool a = carOnA();
+  bool b = carOnB();
+  if (a && !b) enterPhase(A_GREEN, decideGreenDuration(true, false));
+  else if (!a && b) enterPhase(B_GREEN, decideGreenDuration(true, false));
+  else enterPhase(A_GREEN, decideGreenDuration(a, b));
+}
+
+void loop() {
+  uint32_t now = millis();
+  uint32_t elapsed = now - stateStart;
+
+  // Track car activity
+  if (phase == A_GREEN && carOnA()) lastCarSeenInActiveLane = now;
+  if (phase == B_GREEN && carOnB()) lastCarSeenInActiveLane = now_
